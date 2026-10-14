@@ -6,7 +6,7 @@ It was written for the
 [Enveda CASMI 2026 – Molecule ID From Mass Spectra](https://www.kaggle.com/competitions/enveda-CASMI26-molecule-id-mass-spectra)
 Kaggle competition. Teams submit up to 25 ranked SMILES per molecule and are
 scored by MRR@25 on the tautomer-canonical InChIKey connectivity block. The
-entry deadline is 2026-12-07.
+entry deadline is 2026-12-07; final submissions are due 2026-12-14.
 
 It is **one Python file** ([`casmi_baseline.py`](casmi_baseline.py)), standard
 library only, so you can paste it into an offline Kaggle notebook cell or import
@@ -14,27 +14,29 @@ it locally.
 
 | Piece | What it does |
 | --- | --- |
-| `neutral_mass`, `target_mass` | Precursor m/z + adduct → neutral mass (16 common adducts, bracketed or bare names); median over a molecule's spectra. |
+| `neutral_mass`, `target_mass` | Precursor m/z + adduct → neutral mass. Covers all ten test-set adducts (`TEST_ADDUCTS`, including `[M-2H2O+H]+` and `[M+CH2O2-H]-`) plus common training ones, bracketed or bare names; median over a molecule's spectra. |
 | `clean_peaks` | Drop the precursor region and noise (<1% of base peak), centroid within 0.02 Da, normalise. |
 | `entropy_similarity` | Weighted **spectral entropy similarity** (Li et al., *Nature Methods* 2021), closed form, one-to-one peak matching. |
-| `SpectralLibrary`, `rank_candidates` | Mass-indexed library (bisect, ppm window). Each candidate's score is the mean over the query's spectra of its best same-polarity match. Ties break by mass error. |
-| `reciprocal_rank`, `mrr_at_k` | The competition metric for local validation (blank and repeated keys don't use a rank). |
+| `SpectralLibrary`, `rank_candidates`, `near_any` | Mass-indexed library (bisect, ppm window). Each candidate's score is the mean over the query's spectra of its best same-polarity match. Ties break by mass error. |
+| `reciprocal_rank`, `mrr_at_k`, `evaluate` | The competition metric for local validation (blank and repeated keys don't use a rank); `evaluate` scores a labelled split end to end. |
 | `rdkit_key14` | Optional (needs RDKit): tautomer-canonical InChIKey first block, the match key. |
-| `format_cell`, `write_submission`, `validate_submission` | `id,SMILES;SMILES;…` rows in sample order, deduplicated, never empty, ≤25 candidates. |
+| `format_cell`, `write_submission`, `validate_submission` | `molecule_id,SMILES;SMILES;…` rows in sample order, deduplicated, never empty, ≤25 candidates. |
 | `resolve_columns` | Map standard names to the real parquet column names (case-insensitive aliases). |
 
 ## What this is, honestly
 
 This is a **transparent floor**, not a leaderboard contender. Pure library
-search can only rank structures that already have reference spectra. The
-competition's test molecules are mostly absent from public libraries, so strong
-entries add a large structure pool (for example COCONUT), learned
-spectrum-to-fingerprint models, fragmentation evidence and a learned ranker. The
-public Apache-2.0 Kaggle pipeline by prvsiyan and haideptry, and repos built on
-it such as [shiferaxa/casmi26](https://github.com/shiferaxa/casmi26), do all of
-that. Use this file to:
+search can only rank structures that already have reference spectra, and most
+test molecules have none. Public reports put library-only entries at roughly
+0.14–0.23 on the public leaderboard. The strongest public notebooks (about
+0.42 in mid-October 2026) add a large structure pool (COCONUT), analog and
+fragmentation evidence, a spectrum-to-fingerprint model and a learned ranker;
+the top of the board is near 0.49. The Apache-2.0 public pipeline by prvsiyan
+and haideptry, and repos built on it such as
+[shiferaxa/casmi26](https://github.com/shiferaxa/casmi26), do all of that. Use
+this file to:
 
-- get a valid, explainable baseline submission running in minutes;
+- get a valid, explainable baseline submission running;
 - score your own validation split with a dependency-free MRR@25;
 - reuse the adduct table, entropy similarity and submission validator in a
   bigger pipeline.
@@ -54,12 +56,38 @@ for key, smiles, score in rank_candidates(query, lib, ppm=10, k=25):
     print(key, smiles, round(score, 3))
 ```
 
-On Kaggle, [`examples/kaggle_notebook.py`](examples/kaggle_notebook.py) prints
-every input file and its columns, builds a library from training spectra near
-the test target masses, ranks and writes `submission.csv`, and validates it
-against the sample submission. **It has not yet been run on the competition
-data.** The parquet schema is only documented on Kaggle, so check the printed
-column mapping and adjust `ALIASES` if a name resolves to `None`.
+### On Kaggle
+
+[`examples/kaggle_notebook.py`](examples/kaggle_notebook.py) uses the
+competition's column names (`ms2_mzs`, `ms2_normalized_intensities`,
+`precursor_mz`, `adduct`, `inchikey14`, `normalized_smiles`, `ingest_lib`,
+`precursor_error_ppm`; test rows grouped by `molecule_id`; sample submission
+`molecule_id,smiles`). It reads the ~2.5M training spectra in batches with
+pyarrow, keeps only spectra within 10 ppm of a test target mass (and with a
+labelled precursor error under 20 ppm), ranks, writes `submission.csv` and
+validates it against the sample submission.
+
+Set `VALIDATE = True` to score it locally instead. Queries are the
+`enveda-np-examples` structures, which the host measured on the test
+instrument. Their own spectra are left out of the library, while other
+libraries' spectra of the same structures stay in. Public write-ups report that
+this split tracks the leaderboard and random held-out training structures
+don't.
+
+**The notebook has not yet been run on the competition data.** Check the
+printed column mapping before trusting the output. The visible `test.parquet`
+is a placeholder; Kaggle swaps in the hidden test set when a submitted notebook
+is re-run.
+
+## Changes
+
+- **0.2.0** – Adds the two test-set adducts missing from 0.1.0
+  (`[M-2H2O+H]+`, `[M+CH2O2-H]-`); without them those molecules got no
+  candidates. The notebook now uses the real column names (0.1.0 looked for
+  intensities under the wrong name and would have stopped), reads training data
+  in batches and has a `VALIDATE` mode. New: `TEST_ADDUCTS`, `near_any`,
+  `evaluate`. 20 tests.
+- **0.1.0** – First release.
 
 ## Tests
 
@@ -67,9 +95,10 @@ column mapping and adjust `ALIASES` if a name resolves to `None`.
 python test_casmi_baseline.py   # or: pytest
 ```
 
-14 tests on synthetic spectra cover the adduct masses, cleaning, entropy
-similarity (identity, disjoint, partial, tolerance, symmetry), the ppm index,
-ranking and polarity, the metric, and the submission round trip.
+20 tests on synthetic spectra cover the adduct masses (all ten test-set
+adducts), cleaning, entropy similarity (identity, disjoint, partial, tolerance,
+symmetry), the ppm index, ranking and polarity, the metric and split scorer,
+the submission round trip, and column resolution on the competition schema.
 
 ## References
 

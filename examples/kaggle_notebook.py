@@ -3,23 +3,41 @@
 Usage in a notebook: paste casmi_baseline.py into the first cell (or attach it
 as a dataset), then run this file's contents in the next cell.
 
-The competition's parquet column names are only documented on Kaggle, so the
-first thing this script does is print every input file and its columns.  If a
-standard name below resolves to None, add the real column name to ALIASES and
-re-run.  This script has not yet been run against the competition data.
+Column names follow the competition's published schema:
+
+* train.parquet (~2.5M spectra): ingest_lib, normalized_smiles, inchikey,
+  inchikey14, adduct, precursor_mz, precursor_error_ppm, ms2_mzs,
+  ms2_normalized_intensities, ... (no molecule_id: group by inchikey14)
+* test.parquet: molecule_id, spectrum_id, adduct, precursor_mz, ms2_mzs,
+  ms2_normalized_intensities, ...  The visible file is a placeholder; Kaggle
+  swaps in the hidden test set when the submitted notebook is re-run.
+* sample_submission.csv: molecule_id,smiles
+
+The training file is read in batches (pyarrow) and only spectra near a target
+mass are kept, so memory stays small.  Set VALIDATE = True to score the
+baseline locally on the host-measured ``enveda-np-examples`` structures, with
+their own spectra left out of the library (other libraries' spectra of the
+same structure stay in).  Public write-ups report this split as the one that
+tracks the leaderboard.
+
+This script has not yet been run on the competition data; check the printed
+column mapping first.
 """
 
-import bisect
 import glob
 import os
 
+import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from casmi_baseline import (
+    ADDUCTS,
     SpectralLibrary,
     adduct_polarity,
     clean_peaks,
-    neutral_mass,
+    evaluate,
+    normalize_adduct,
     rank_candidates,
     read_sample_submission,
     resolve_columns,
@@ -31,73 +49,128 @@ from casmi_baseline import (
 INPUT = "/kaggle/input"
 PPM = 10.0
 K = 25
+MAX_ERROR_PPM = 20.0  # drop training spectra whose labelled precursor is further off
+BATCH = 200_000
+VALIDATE = False
+VALID_LIB = "enveda-np-examples"
 
 ALIASES = {
-    "molecule_id": ["molecule_id", "query_id", "id", "compound_id", "target_id"],
-    "spectrum_id": ["spectrum_id", "spec_id", "scan_id"],
-    "smiles": ["normalized_smiles", "smiles", "canonical_smiles"],
-    "inchikey": ["inchikey", "inchi_key"],
-    "precursor_mz": ["precursor_mz", "precursormz", "pepmass", "prec_mz"],
-    "adduct": ["adduct", "precursor_type", "ion_type"],
-    "mzs": ["ms2_mzs", "mzs", "mz", "peaks_mz"],
-    "intensities": ["ms2_intensities", "intensities", "intensity", "peaks_intensity"],
+    "molecule_id": ["molecule_id"],
+    "smiles": ["normalized_smiles", "smiles"],
+    "key": ["inchikey14", "inchikey"],
+    "precursor_mz": ["precursor_mz"],
+    "adduct": ["adduct"],
+    "mzs": ["ms2_mzs"],
+    "intensities": ["ms2_normalized_intensities", "ms2_intensities", "intensities"],
+    "lib": ["ingest_lib"],
+    "error_ppm": ["precursor_error_ppm"],
 }
 
 
-def show_inputs():
-    files = sorted(glob.glob(os.path.join(INPUT, "**", "*.*"), recursive=True))
-    for path in files:
-        print(path)
-        if path.endswith(".parquet"):
-            df = pd.read_parquet(path)
-            print("   rows=%d columns=%s" % (len(df), list(df.columns)))
-    return files
-
-
-def find(files, *words, ext=".parquet"):
+def find(files, word, ext):
     for path in files:
         name = os.path.basename(path).lower()
-        if path.endswith(ext) and all(w in name for w in words):
+        if path.endswith(ext) and word in name:
             return path
     return None
 
 
-def spectrum(row, col):
-    peaks = clean_peaks(row[col["mzs"]], row[col["intensities"]], row[col["precursor_mz"]])
-    return {"precursor_mz": row[col["precursor_mz"]], "adduct": row[col["adduct"]], "peaks": peaks}
+def columns_of(path):
+    col = resolve_columns(pq.ParquetFile(path).schema_arrow.names, ALIASES)
+    print(os.path.basename(path), col)
+    return col
+
+
+def batches(path, col):
+    """Yield pandas frames of the needed columns, BATCH rows at a time."""
+    names = sorted({c for c in col.values() if c})
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=BATCH, columns=names):
+        yield batch.to_pandas()
+
+
+def neutral_masses(df, col):
+    """Neutral mass per row (NaN where the adduct is unknown)."""
+    out = np.full(len(df), np.nan)
+    mz = df[col["precursor_mz"]].to_numpy(dtype=float)
+    adducts = df[col["adduct"]].astype(str).to_numpy()
+    for a in np.unique(adducts):
+        key = normalize_adduct(a)
+        if key is None:
+            continue
+        n, z, shift = ADDUCTS[key]
+        sel = adducts == a
+        out[sel] = (mz[sel] * abs(z) - shift) / n
+    return out
+
+
+def near(masses, targets, ppm):
+    """Boolean mask: mass within ppm of some value in sorted ``targets``."""
+    idx = np.searchsorted(targets, masses * (1 - ppm * 1e-6))
+    hit = np.zeros(len(masses), dtype=bool)
+    ok = idx < len(targets)
+    hit[ok] = targets[idx[ok]] <= masses[ok] * (1 + ppm * 1e-6)
+    return hit
+
+
+def spectra(df, col):
+    """``(precursor_mz, adduct, cleaned peaks)`` per row."""
+    for prec, adduct, mzs, ints in zip(df[col["precursor_mz"]], df[col["adduct"]],
+                                       df[col["mzs"]], df[col["intensities"]]):
+        yield prec, adduct, clean_peaks(mzs, ints, prec)
+
+
+def group_queries(df, col, ids):
+    queries = {}
+    for gid, (prec, adduct, peaks) in zip(ids, spectra(df, col)):
+        queries.setdefault(str(gid), []).append({"precursor_mz": prec, "adduct": adduct, "peaks": peaks})
+    return queries
+
+
+def build_library(train_path, col, targets, exclude_lib=None):
+    lib = SpectralLibrary()
+    for df in batches(train_path, col):
+        keep = near(neutral_masses(df, col), targets, PPM)
+        if col["error_ppm"]:
+            err = df[col["error_ppm"]].to_numpy(dtype=float)
+            keep &= ~(np.abs(err) > MAX_ERROR_PPM)  # NaN errors are kept
+        if exclude_lib and col["lib"]:
+            keep &= (df[col["lib"]] != exclude_lib).to_numpy()
+        sub = df[keep]
+        masses = neutral_masses(sub, col)
+        keys = sub[col["key"]].astype(str).str[:14]
+        for mass, key, smiles, (prec, adduct, peaks) in zip(masses, keys, sub[col["smiles"]], spectra(sub, col)):
+            lib.add(key, smiles, mass, peaks, adduct_polarity(adduct))
+    print("library spectra kept:", len(lib))
+    return lib
+
+
+def validation_queries(train_path, col):
+    hold = pd.concat([df[df[col["lib"]] == VALID_LIB] for df in batches(train_path, col)])
+    return group_queries(hold, col, hold[col["key"]].astype(str).str[:14])
 
 
 def main():
-    files = show_inputs()
-    sample_path = find(files, "sample", ext=".csv")
-    train_path, test_path = find(files, "train"), find(files, "test")
+    files = sorted(glob.glob(os.path.join(INPUT, "**", "*.*"), recursive=True))
+    sample_path = find(files, "sample", ".csv")
+    train_path, test_path = find(files, "train", ".parquet"), find(files, "test", ".parquet")
     print("sample:", sample_path, "\ntrain:", train_path, "\ntest:", test_path)
+    col = columns_of(train_path)
 
-    test = pd.read_parquet(test_path)
-    tcol = resolve_columns(test.columns, ALIASES)
-    print("test columns:", tcol)
-    queries = {}
-    for _, row in test.iterrows():
-        queries.setdefault(str(row[tcol["molecule_id"]]), []).append(spectrum(row, tcol))
-    targets = sorted(m for m in (target_mass(q) for q in queries.values()) if m is not None)
+    if VALIDATE:
+        queries = validation_queries(train_path, col)
+        targets = np.array(sorted(m for m in (target_mass(q) for q in queries.values()) if m is not None))
+        print("validation structures:", len(queries))
+        lib = build_library(train_path, col, targets, exclude_lib=VALID_LIB)
+        truth = {k: k for k in queries}
+        print("MRR@%d (own spectra hidden): %.4f" % (K, evaluate(queries, truth, lib, PPM, K)))
+        return
+
+    tcol = columns_of(test_path)
+    test = pq.read_table(test_path).to_pandas()
+    queries = group_queries(test, tcol, test[tcol["molecule_id"]])
+    targets = np.array(sorted(m for m in (target_mass(q) for q in queries.values()) if m is not None))
     print("molecules:", len(queries), "with a target mass:", len(targets))
-
-    # keep only training spectra whose neutral mass is near some test target
-    train = pd.read_parquet(train_path)
-    col = resolve_columns(train.columns, ALIASES)
-    print("train columns:", col)
-    lib = SpectralLibrary()
-    for _, row in train.iterrows():
-        mass = neutral_mass(row[col["precursor_mz"]], row[col["adduct"]])
-        if mass is None:
-            continue
-        i = bisect.bisect_left(targets, mass * (1 - PPM * 1e-6))
-        if i == len(targets) or targets[i] > mass * (1 + PPM * 1e-6):
-            continue
-        smiles = row[col["smiles"]]
-        key = str(row[col["inchikey"]])[:14] if col["inchikey"] else smiles
-        lib.add(key, smiles, mass, spectrum(row, col)["peaks"], adduct_polarity(row[col["adduct"]]))
-    print("library spectra kept:", len(lib))
+    lib = build_library(train_path, col, targets)
 
     try:
         from casmi_baseline import rdkit_key14

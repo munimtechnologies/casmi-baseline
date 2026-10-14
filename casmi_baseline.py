@@ -6,16 +6,17 @@ It is one file on purpose: paste it into a Kaggle notebook cell (code
 competitions run offline) or import it locally.  Pieces:
 
 * ``neutral_mass`` / ``target_mass`` -- precursor m/z + adduct -> neutral mass;
-  the median over a molecule's spectra is its target mass.
+  the median over a molecule's spectra is its target mass.  The table covers
+  all ten adducts used in the competition's test set.
 * ``clean_peaks`` -- drop precursor-region and noise peaks, centroid, normalise.
 * ``entropy_similarity`` -- (weighted) spectral entropy similarity
   (Li et al., Nature Methods 2021).
 * ``SpectralLibrary`` / ``rank_candidates`` -- precursor-mass-indexed library
   search that ranks candidate structures for one molecule.
-* ``reciprocal_rank`` / ``mrr_at_k`` -- the competition metric (MRR@25 over
-  structure keys) for local validation.
+* ``reciprocal_rank`` / ``mrr_at_k`` / ``evaluate`` -- the competition metric
+  (MRR@25 over structure keys) for local validation.
 * ``format_cell`` / ``write_submission`` / ``validate_submission`` -- the
-  ``id,<up to 25 SMILES joined by ';'>`` submission file.
+  ``molecule_id,<up to 25 SMILES joined by ';'>`` submission file.
 * ``rdkit_key14`` -- optional, needs RDKit: tautomer-canonical InChIKey
   connectivity block (first 14 characters), the competition's match key.
 
@@ -28,10 +29,11 @@ import csv
 import math
 import statistics
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 PROTON = 1.007276
 H2O = 18.010565
+FORMATE = 44.998201  # HCOO- (CH2O2 - H)
 
 # adduct -> (molecules per ion, charge, mass added to n*M); m/z = (n*M + shift) / |z|
 ADDUCTS = {
@@ -41,6 +43,8 @@ ADDUCTS = {
     "[M+K]+": (1, 1, 38.963158),
     "[M+H-H2O]+": (1, 1, PROTON - H2O),
     "[M-H2O+H]+": (1, 1, PROTON - H2O),
+    "[M+H-2H2O]+": (1, 1, PROTON - 2 * H2O),
+    "[M-2H2O+H]+": (1, 1, PROTON - 2 * H2O),
     "[M+2H]2+": (1, 2, 2 * PROTON),
     "[2M+H]+": (2, 1, PROTON),
     "[2M+Na]+": (2, 1, 22.989218),
@@ -49,12 +53,19 @@ ADDUCTS = {
     "[M-H-H2O]-": (1, -1, -PROTON - H2O),
     "[M-H2O-H]-": (1, -1, -PROTON - H2O),
     "[M+Cl]-": (1, -1, 34.969402),
-    "[M+FA-H]-": (1, -1, 44.998201),
-    "[M+HCOO]-": (1, -1, 44.998201),
+    "[M+FA-H]-": (1, -1, FORMATE),
+    "[M+HCOO]-": (1, -1, FORMATE),
+    "[M+CH2O2-H]-": (1, -1, FORMATE),
     "[M+CH3COO]-": (1, -1, 59.013851),
     "[M-2H]2-": (1, -2, -2 * PROTON),
     "[2M-H]-": (2, -1, -PROTON),
 }
+
+# the ten adducts listed for the CASMI 2026 test spectra
+TEST_ADDUCTS = (
+    "[M+H]+", "[M+NH4]+", "[M-H2O+H]+", "[M-2H2O+H]+", "[M+Na]+", "[M+K]+",
+    "[M-H]-", "[M-H2O-H]-", "[M+CH2O2-H]-", "[M+Cl]-",
+)
 
 
 # ---------------------------------------------------------------- masses
@@ -117,6 +128,15 @@ def ppm_window(mass, ppm):
     """``(low, high)`` mass bounds for a +/- ``ppm`` tolerance."""
     delta = mass * ppm * 1e-6
     return mass - delta, mass + delta
+
+
+def near_any(mass, sorted_targets, ppm):
+    """True if ``mass`` is within ``ppm`` of any value in ``sorted_targets``."""
+    if mass is None:
+        return False
+    lo, hi = ppm_window(mass, ppm)
+    i = bisect.bisect_left(sorted_targets, lo)
+    return i < len(sorted_targets) and sorted_targets[i] <= hi
 
 
 # ---------------------------------------------------------------- spectra
@@ -313,6 +333,18 @@ def mrr_at_k(truth, predictions, k=25):
     if not truth:
         return 0.0
     return sum(reciprocal_rank(t, predictions.get(i, ()), k) for i, t in truth.items()) / len(truth)
+
+
+def evaluate(queries, truth, library, ppm=10.0, k=25, tol=0.02, weighted=True):
+    """MRR@k of :func:`rank_candidates` on a labelled split.
+
+    ``queries`` maps ``id -> query spectra``, ``truth`` maps ``id -> key``.
+    Keep the query spectra out of ``library`` (or the score is meaningless)."""
+    predictions = {
+        i: [key for key, _, _ in rank_candidates(q, library, ppm, k, tol, weighted)]
+        for i, q in queries.items()
+    }
+    return mrr_at_k(truth, predictions, k)
 
 
 _TAUTOMERS = None
