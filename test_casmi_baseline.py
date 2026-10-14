@@ -15,12 +15,14 @@ from casmi_baseline import (
     entropy_similarity,
     evaluate,
     format_cell,
+    fuse_rankings,
     mrr_at_k,
     near_any,
     neutral_mass,
     normalize_adduct,
     rank_candidates,
     read_sample_submission,
+    read_submission,
     reciprocal_rank,
     resolve_columns,
     target_mass,
@@ -178,6 +180,32 @@ def test_rank_candidates_with_formate_adduct():
     assert [r[0] for r in rank_candidates(query, lib)] == ["GLC"]
 
 
+L1 = [("A", "a"), ("B", "b"), ("C", "c")]
+L2 = [("B", "b2"), ("A", "a2"), ("D", "d")]
+
+
+def test_fuse_rankings_equal_weights_and_ties():
+    fused = fuse_rankings([L1, L2])
+    # A and B tie; A was seen first. C and D tie; C was seen first.
+    assert [f[0] for f in fused] == ["A", "B", "C", "D"]
+    assert [f[1] for f in fused] == ["a", "b", "c", "d"]
+    assert approx(fused[0][2], 1 / 61 + 1 / 62)
+    assert approx(fused[3][2], 1 / 63)
+
+
+def test_fuse_rankings_weights_and_cap():
+    assert [f[0] for f in fuse_rankings([L1, L2], weights=[1, 2])] == ["B", "A", "D", "C"]
+    assert [f[0] for f in fuse_rankings([L1, L2], weights=[1, 0])] == ["A", "B", "C", "D"]
+    assert [f[0] for f in fuse_rankings([L1, L2], k=2)] == ["A", "B"]
+    assert fuse_rankings([]) == []
+
+
+def test_fuse_rankings_skips_blank_and_repeated_keys():
+    fused = fuse_rankings([[("A", "a"), ("A", "a"), ("", "x"), (None, "y"), ("B", "b")]])
+    assert [f[0] for f in fused] == ["A", "B"]
+    assert approx(fused[1][2], 1 / 62)
+
+
 def test_reciprocal_rank_and_mrr():
     assert reciprocal_rank("A", ["A"]) == 1.0
     assert reciprocal_rank("A", ["B", "A"]) == 0.5
@@ -220,10 +248,19 @@ def test_write_read_validate_roundtrip():
         lines = fh.read().splitlines()
     assert lines == ["molecule_id,smiles", "m1,CCO;CCN", "m2,C"]
     assert validate_submission(out, sample) == []
+    assert read_submission(out) == {"m1": ["CCO", "CCN"], "m2": ["C"]}
     bad = os.path.join(d, "bad.csv")
     with open(bad, "w", encoding="utf-8", newline="") as fh:
         fh.write("molecule_id,smiles\nm2,C\nm1,C\n")
     assert validate_submission(bad, sample) != []
+
+
+def test_read_submission_strips_and_skips_blanks():
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "other.csv")
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write("molecule_id,smiles\nm1,CCO; CCN;;\nm2\n\n")
+    assert read_submission(path) == {"m1": ["CCO", "CCN"], "m2": []}
 
 
 def test_resolve_columns_case_insensitive():

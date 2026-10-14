@@ -18,6 +18,7 @@ it locally.
 | `clean_peaks` | Drop the precursor region and noise (<1% of base peak), centroid within 0.02 Da, normalise. |
 | `entropy_similarity` | Weighted **spectral entropy similarity** (Li et al., *Nature Methods* 2021), closed form, one-to-one peak matching. |
 | `SpectralLibrary`, `rank_candidates`, `near_any` | Mass-indexed library (bisect, ppm window). Each candidate's score is the mean over the query's spectra of its best same-polarity match. Ties break by mass error. |
+| `fuse_rankings`, `read_submission` | Weighted **reciprocal-rank fusion** of several ranked candidate lists for a molecule, e.g. a bigger pipeline's output plus this library search. |
 | `reciprocal_rank`, `mrr_at_k`, `evaluate` | The competition metric for local validation (blank and repeated keys don't use a rank); `evaluate` scores a labelled split end to end. |
 | `rdkit_key14` | Optional (needs RDKit): tautomer-canonical InChIKey first block, the match key. |
 | `format_cell`, `write_submission`, `validate_submission` | `molecule_id,SMILES;SMILES;…` rows in sample order, deduplicated, never empty, ≤25 candidates. |
@@ -28,16 +29,17 @@ it locally.
 This is a **transparent floor**, not a leaderboard contender. Pure library
 search can only rank structures that already have reference spectra, and most
 test molecules have none. Public reports put library-only entries at roughly
-0.14–0.23 on the public leaderboard. The strongest public notebooks (about
-0.42 in mid-October 2026) add a large structure pool (COCONUT), analog and
-fragmentation evidence, a spectrum-to-fingerprint model and a learned ranker;
-the top of the board is near 0.49. The Apache-2.0 public pipeline by prvsiyan
-and haideptry, and repos built on it such as
+0.14–0.23 on the public leaderboard. On 2026-10-14 the best public notebooks
+(several tied at 0.441, Apache-2.0) add a large structure pool (COCONUT),
+analog and fragmentation evidence, a spectrum-to-fingerprint model and a
+learned ranker; the top of the board is near 0.49. The Apache-2.0 public
+pipeline by prvsiyan and haideptry, and repos built on it such as
 [shiferaxa/casmi26](https://github.com/shiferaxa/casmi26), do all of that. Use
 this file to:
 
 - get a valid, explainable baseline submission running;
 - score your own validation split with a dependency-free MRR@25;
+- fuse a stronger pipeline's ranking with spectral-library evidence;
 - reuse the adduct table, entropy similarity and submission validator in a
   bigger pipeline.
 
@@ -55,6 +57,28 @@ query = [{"precursor_mz": 181.0707, "adduct": "[M+H]+",
 for key, smiles, score in rank_candidates(query, lib, ppm=10, k=25):
     print(key, smiles, round(score, 3))
 ```
+
+### Fusing with a bigger pipeline
+
+Run the other pipeline first in the same notebook so it writes its own
+submission file, then blend it with the library search, one molecule at a time:
+
+```python
+from casmi_baseline import fuse_rankings, rank_candidates, rdkit_key14, read_submission
+
+theirs = read_submission("/kaggle/working/pipeline_submission.csv")
+fused = {}
+for mid, smiles_list in theirs.items():
+    a = [(rdkit_key14(s), s) for s in smiles_list]
+    b = [(rdkit_key14(s), s) for _, s, _ in rank_candidates(queries[mid], lib)]
+    fused[mid] = [s for _, s, _ in fuse_rankings([a, b], weights=[1.0, 0.5])]
+```
+
+Use the same key function on both lists so that one structure counts as one
+candidate. The weights above are placeholders, not tuned values. Tune them on
+the `enveda-np-examples` validation split (see `VALIDATE` below) with
+`mrr_at_k` before trusting them, because fusion can lower the score when one
+list is much weaker.
 
 ### On Kaggle
 
@@ -81,6 +105,10 @@ is re-run.
 
 ## Changes
 
+- **0.3.0** – Adds `fuse_rankings` (weighted reciprocal-rank fusion, Cormack et
+  al. 2009) and `read_submission`, so the library search can be blended with a
+  stronger pipeline's ranked candidates. Updates the leaderboard figures to
+  2026-10-14. 24 tests.
 - **0.2.0** – Adds the two test-set adducts missing from 0.1.0
   (`[M-2H2O+H]+`, `[M+CH2O2-H]-`); without them those molecules got no
   candidates. The notebook now uses the real column names (0.1.0 looked for
@@ -95,15 +123,18 @@ is re-run.
 python test_casmi_baseline.py   # or: pytest
 ```
 
-20 tests on synthetic spectra cover the adduct masses (all ten test-set
+24 tests on synthetic spectra cover the adduct masses (all ten test-set
 adducts), cleaning, entropy similarity (identity, disjoint, partial, tolerance,
-symmetry), the ppm index, ranking and polarity, the metric and split scorer,
-the submission round trip, and column resolution on the competition schema.
+symmetry), the ppm index, ranking and polarity, rank fusion (weights, ties,
+repeated keys), the metric and split scorer, the submission round trip, and
+column resolution on the competition schema.
 
 ## References
 
 - Li, Y. et al. *Spectral entropy outperforms MS/MS dot product similarity for
   small-molecule compound identification.* Nature Methods 18, 1524–1531 (2021).
+- Cormack, G. V., Clarke, C. L. A. & Büttcher, S. *Reciprocal rank fusion
+  outperforms Condorcet and individual rank learning methods.* SIGIR 2009.
 - Competition metric as described on the Kaggle competition page: MRR@25 on the
   first 14 characters of the InChIKey after RDKit tautomer canonicalisation.
 

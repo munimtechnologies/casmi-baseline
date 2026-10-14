@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "casmi-baseline"
-version = "0.2.0"
+version = "0.3.0"
 description = "Dependency-free spectral-library-search baseline and MRR@25 scorer for small-molecule identification from MS/MS (Enveda CASMI 2026)."
 readme = "README.md"
 requires-python = ">=3.8"

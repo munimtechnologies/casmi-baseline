@@ -13,6 +13,8 @@ competitions run offline) or import it locally.  Pieces:
   (Li et al., Nature Methods 2021).
 * ``SpectralLibrary`` / ``rank_candidates`` -- precursor-mass-indexed library
   search that ranks candidate structures for one molecule.
+* ``fuse_rankings`` / ``read_submission`` -- weighted reciprocal-rank fusion of
+  this ranking with another pipeline's ranked candidates.
 * ``reciprocal_rank`` / ``mrr_at_k`` / ``evaluate`` -- the competition metric
   (MRR@25 over structure keys) for local validation.
 * ``format_cell`` / ``write_submission`` / ``validate_submission`` -- the
@@ -29,7 +31,7 @@ import csv
 import math
 import statistics
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 PROTON = 1.007276
 H2O = 18.010565
@@ -307,6 +309,34 @@ def rank_candidates(query_spectra, library, ppm=10.0, k=25, tol=0.02,
     return [(key, smiles, -neg) for neg, _, key, smiles in ranked[:k]]
 
 
+def fuse_rankings(rankings, weights=None, k=25, rrf_k=60):
+    """Weighted reciprocal-rank fusion (Cormack et al., SIGIR 2009) of several
+    ranked candidate lists for one molecule.
+
+    ``rankings`` is a list of ranked lists of ``(key, smiles)`` pairs, e.g. one
+    from a bigger pipeline and one from :func:`rank_candidates`.  A key at rank
+    ``r`` (1-based, blank and repeated keys skipped) in list ``j`` adds
+    ``weights[j] / (rrf_k + r)``.  Ties break by first appearance, scanning the
+    lists in order.  Returns up to ``k`` tuples ``(key, smiles, score)``."""
+    if weights is None:
+        weights = [1.0] * len(rankings)
+    scores, smiles_of, order = {}, {}, {}
+    for ranking, w in zip(rankings, weights):
+        seen = set()
+        rank = 0
+        for key, smiles in ranking:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rank += 1
+            if key not in order:
+                order[key] = len(order)
+                smiles_of[key] = smiles
+            scores[key] = scores.get(key, 0.0) + float(w) / (rrf_k + rank)
+    ranked = sorted(scores, key=lambda c: (-scores[c], order[c]))
+    return [(c, smiles_of[c], scores[c]) for c in ranked[:k]]
+
+
 # ---------------------------------------------------------------- metric
 
 
@@ -403,6 +433,18 @@ def read_sample_submission(path):
         header = next(reader)
         ids = [row[0] for row in reader if row]
     return header, ids
+
+
+def read_submission(path):
+    """Return ``{id: [SMILES, ...]}`` from a submission file, in ranked order
+    (e.g. another pipeline's output, to fuse with this one)."""
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        next(reader, None)
+        return {
+            row[0]: [s.strip() for s in (row[1] if len(row) > 1 else "").split(";") if s.strip()]
+            for row in reader if row
+        }
 
 
 def write_submission(path, header, ids, predictions, key=None, k=25):
