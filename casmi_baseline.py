@@ -23,7 +23,7 @@ competitions run offline) or import it locally.  Pieces:
   connectivity block (first 14 characters), the competition's match key.
 
 Made by MV2 of Munim, Inc., with the code written by AI agents working in his
-name.  MIT licensed.
+name.  Apache-2.0 licensed.
 """
 
 import bisect

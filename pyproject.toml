@@ -8,12 +8,12 @@ version = "0.3.0"
 description = "Dependency-free spectral-library-search baseline and MRR@25 scorer for small-molecule identification from MS/MS (Enveda CASMI 2026)."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "MV2 of Munim, Inc." }]
 keywords = ["mass-spectrometry", "metabolomics", "spectral-entropy", "casmi", "cheminformatics"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Topic :: Scientific/Engineering :: Chemistry",
     "Intended Audience :: Science/Research",
 ]
