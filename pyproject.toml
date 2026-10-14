@@ -22,4 +22,4 @@ classifiers = [
 rdkit = ["rdkit"]
 
 [project.urls]
-Homepage = "https://github.com/munimv2/casmi-baseline"
+Homepage = "https://github.com/munimtechnologies/casmi-baseline"
